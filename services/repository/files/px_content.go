@@ -12,6 +12,7 @@ import (
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/lfs"
 	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/typesniffer"
 	"code.gitea.io/gitea/modules/util"
 )
 
@@ -53,7 +54,7 @@ func GetCommitContentsOrList(ctx context.Context, repo *repo_model.Repository, t
 	}
 
 	if entry.Type() != "tree" {
-		return GetCommitContents(ctx, repo, treePath, origRef, false)
+		return GetCommitContent(ctx, repo, treePath, origRef, false)
 	}
 
 	// We are in a directory, so we return a list of FileContentResponse objects
@@ -78,7 +79,152 @@ func GetCommitContentsOrList(ctx context.Context, repo *repo_model.Repository, t
 	return fileList, nil
 }
 
-// GetCommitContents gets the meta data on a file's contents. Ref can be a branch, commit or tag
+// GetCommitContent gets the meta data on a file's content. Ref can be a branch, commit or tag
+func GetCommitContent(ctx context.Context, repo *repo_model.Repository, treePath, ref string, forList bool) (*api.CommitContentsResponse, error) {
+	if ref == "" {
+		ref = repo.DefaultBranch
+	}
+	origRef := ref
+
+	// Check that the path given in opts.treePath is valid (not a git path)
+	cleanTreePath := CleanUploadFileName(treePath)
+	if cleanTreePath == "" && treePath != "" {
+		return nil, models.ErrFilenameInvalid{
+			Path: treePath,
+		}
+	}
+	treePath = cleanTreePath
+
+	gitRepo, closer, err := git.RepositoryFromContextOrOpen(ctx, repo.RepoPath())
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	// Get the commit object for the ref
+	commit, err := gitRepo.GetCommit(ref)
+	if err != nil {
+		return nil, err
+	}
+	commitID := commit.ID.String()
+	if len(ref) >= 4 && strings.HasPrefix(commitID, ref) {
+		ref = commit.ID.String()
+	}
+
+	entry, err := commit.GetTreeEntryByPath(treePath)
+	if err != nil {
+		return nil, err
+	}
+
+	refType := gitRepo.GetRefType(ref)
+	if refType == "invalid" {
+		return nil, fmt.Errorf("no commit found for the ref [ref: %s]", ref)
+	}
+
+	selfURL, err := url.Parse(repo.APIURL() + "/contents/" + util.PathEscapeSegments(treePath) + "?ref=" + url.QueryEscape(origRef))
+	if err != nil {
+		return nil, err
+	}
+	selfURLString := selfURL.String()
+
+	err = gitRepo.AddLastCommitCache(repo.GetCommitsCountCacheKey(ref, refType != git.ObjectCommit), repo.FullName(), commitID)
+	if err != nil {
+		return nil, err
+	}
+
+	lastCommit, err := commit.GetCommitByPath(treePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// All content types have these fields in populated
+	contentsResponse := &api.CommitContentsResponse{
+		Name:              entry.Name(),
+		Path:              treePath,
+		SHA:               entry.ID.String(),
+		LastCommitSHA:     lastCommit.ID.String(),
+		LastCommitMessage: lastCommit.CommitMessage,
+		LastCommitCreate:  lastCommit.Committer.When,
+		Size:              entry.Size(),
+		URL:               &selfURLString,
+		Links: &api.FileLinksResponse{
+			Self: &selfURLString,
+		},
+	}
+
+	if p, b := isLFS(entry); b {
+		contentsResponse.Size = p.Size
+		contentsResponse.IsLFS = true
+	}
+
+	isBinary, err := IsBinary(entry)
+	if err != nil {
+		return nil, err
+	}
+
+	contentsResponse.IsBinary = &isBinary
+
+	// Now populate the rest of the ContentsResponse based on entry type
+	if entry.IsRegular() || entry.IsExecutable() {
+		contentsResponse.Type = string(ContentTypeRegular)
+		if blobResponse, err := GetBlobBySHA(ctx, repo, gitRepo, entry.ID.String()); err != nil {
+			return nil, err
+		} else if !forList {
+			// We don't show the content if we are getting a list of FileContentResponses
+			contentsResponse.Encoding = &blobResponse.Encoding
+			contentsResponse.Content = &blobResponse.Content
+		}
+	} else if entry.IsDir() {
+		contentsResponse.Type = string(ContentTypeDir)
+	} else if entry.IsLink() {
+		contentsResponse.Type = string(ContentTypeLink)
+		// The target of a symlink file is the content of the file
+		targetFromContent, err := entry.Blob().GetBlobContent(1024)
+		if err != nil {
+			return nil, err
+		}
+		contentsResponse.Target = &targetFromContent
+	} else if entry.IsSubModule() {
+		contentsResponse.Type = string(ContentTypeSubmodule)
+		submodule, err := commit.GetSubModule(treePath)
+		if err != nil {
+			return nil, err
+		}
+		if submodule != nil && submodule.URL != "" {
+			contentsResponse.SubmoduleGitURL = &submodule.URL
+		}
+	}
+	// Handle links
+	if entry.IsRegular() || entry.IsLink() {
+		downloadURL, err := url.Parse(repo.HTMLURL() + "/raw/" + url.PathEscape(string(refType)) + "/" + util.PathEscapeSegments(ref) + "/" + util.PathEscapeSegments(treePath))
+		if err != nil {
+			return nil, err
+		}
+		downloadURLString := downloadURL.String()
+		contentsResponse.DownloadURL = &downloadURLString
+	}
+	if !entry.IsSubModule() {
+		htmlURL, err := url.Parse(repo.HTMLURL() + "/src/" + url.PathEscape(string(refType)) + "/" + util.PathEscapeSegments(ref) + "/" + util.PathEscapeSegments(treePath))
+		if err != nil {
+			return nil, err
+		}
+		htmlURLString := htmlURL.String()
+		contentsResponse.HTMLURL = &htmlURLString
+		contentsResponse.Links.HTMLURL = &htmlURLString
+
+		gitURL, err := url.Parse(repo.APIURL() + "/git/blobs/" + url.PathEscape(entry.ID.String()))
+		if err != nil {
+			return nil, err
+		}
+		gitURLString := gitURL.String()
+		contentsResponse.GitURL = &gitURLString
+		contentsResponse.Links.GitURL = &gitURLString
+	}
+
+	return contentsResponse, nil
+}
+
+// GetCommitContents gets the meta data on a directory's contents. Ref can be a branch, commit or tag
 func GetCommitContents(ctx context.Context, repo *repo_model.Repository, treePath, ref string, forList bool) (*api.CommitContentsResponse, error) {
 	if ref == "" {
 		ref = repo.DefaultBranch
@@ -230,4 +376,19 @@ func isLFS(entry *git.TreeEntry) (lfs.Pointer, bool) {
 	p, err := lfs.ReadPointer(reader)
 
 	return p, err == nil
+}
+
+func IsBinary(entry *git.TreeEntry) (bool, error) {
+	dataRc, err := entry.Blob().DataAsync()
+	if err != nil {
+		return false, err
+	}
+
+	buf := make([]byte, 1024)
+	n, _ := util.ReadAtMost(dataRc, buf)
+	buf = buf[:n]
+
+	st := typesniffer.DetectContentType(buf)
+
+	return !st.IsText(), nil
 }

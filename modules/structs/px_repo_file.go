@@ -8,6 +8,7 @@ type CommitContentsResponse struct {
 	GitURL      *string `json:"git_url"`
 	HTMLURL     *string `json:"html_url"`
 	DownloadURL *string `json:"download_url"`
+	IsBinary    *bool   `json:"is_binary,omitempty"`
 
 	Name              string    `json:"name"`
 	Path              string    `json:"path"`
