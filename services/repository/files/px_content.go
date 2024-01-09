@@ -16,6 +16,8 @@ import (
 	"code.gitea.io/gitea/modules/util"
 )
 
+type checkOption func(*api.CommitContentsResponse, *git.TreeEntry) error
+
 // GetCommitContentsOrList gets the meta data of a file's contents (*ContentsResponse) if treePath not a tree
 // directory, otherwise a listing of file contents ([]*ContentsResponse). Ref can be a branch, commit or tag
 func GetCommitContentsOrList(ctx context.Context, repo *repo_model.Repository, treePath, ref string) (any, error) {
@@ -54,7 +56,7 @@ func GetCommitContentsOrList(ctx context.Context, repo *repo_model.Repository, t
 	}
 
 	if entry.Type() != "tree" {
-		return GetCommitContents(ctx, repo, treePath, origRef, false, CheckIsNonText)
+		return GetCommitContents(ctx, repo, treePath, origRef, false, checkIsNonText)
 	}
 
 	// We are in a directory, so we return a list of FileContentResponse objects
@@ -80,7 +82,14 @@ func GetCommitContentsOrList(ctx context.Context, repo *repo_model.Repository, t
 }
 
 // GetCommitContents gets the meta data on a directory's or a file's contents. Ref can be a branch, commit or tag
-func GetCommitContents(ctx context.Context, repo *repo_model.Repository, treePath, ref string, forList bool, options ...func(*api.CommitContentsResponse, *git.TreeEntry) error) (*api.CommitContentsResponse, error) {
+func GetCommitContents(
+	ctx context.Context,
+	repo *repo_model.Repository,
+	treePath,
+	ref string,
+	forList bool,
+	options ...checkOption,
+) (*api.CommitContentsResponse, error) {
 	if ref == "" {
 		ref = repo.DefaultBranch
 	}
@@ -223,8 +232,8 @@ func GetCommitContents(ctx context.Context, repo *repo_model.Repository, treePat
 	return contentsResponse, nil
 }
 
-func CheckIsNonText(response *api.CommitContentsResponse, entry *git.TreeEntry) error {
-	isNonText, err := IsNonText(entry)
+func checkIsNonText(response *api.CommitContentsResponse, entry *git.TreeEntry) error {
+	isNonText, err := isNonText(entry)
 
 	if err != nil {
 		return err
@@ -251,7 +260,7 @@ func isLFS(entry *git.TreeEntry) (lfs.Pointer, bool) {
 	return p, err == nil
 }
 
-func IsNonText(entry *git.TreeEntry) (bool, error) {
+func isNonText(entry *git.TreeEntry) (bool, error) {
 	if !entry.IsRegular() {
 		return false, nil
 	}
